@@ -34,5 +34,5 @@ Your original files are never changed; you get new copies.
 - Existing tags (title, artist, album...) are kept. Any old cover is replaced.
 - HEIC/WebP/etc. images are converted to JPEG automatically. The default max cover size is 800 px.
 - Folders can't be selected on iPhone, so pick files directly. Do very large batches in groups.
-- Old ID3v2.2 tags are replaced by a new ID3v2.3 tag (text tags in those rare files are lost).
+- Tags are always written as ID3v2.3 (best compatibility, e.g. Spotify local files). ID3v2.4 tags are converted; v2.4-only frames are dropped. Old ID3v2.2 tags are replaced by a fresh v2.3 tag (their text tags are lost).
 - After you edit files in the repo, bump `VERSION` in `sw.js` so installed copies update.

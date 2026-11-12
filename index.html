@@ -128,17 +128,25 @@
       Your original files are not changed.</p>
   </section>
 
-  <footer>Writes a standard ID3v2 front-cover tag. Other tags (title, artist, …) are kept.</footer>
+  <footer>Writes a standard ID3v2.3 front-cover tag. Other tags (title, artist, …) are kept.</footer>
 </main>
 
 <script>
 // <ID3>
+// Always writes ID3v2.3 (most compatible, e.g. Spotify local files). Existing v2.4 tags are converted.
 const u32 = (b, o) => ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
 const readSS = (b, o) => ((b[o] & 0x7f) << 21) | ((b[o + 1] & 0x7f) << 14) | ((b[o + 2] & 0x7f) << 7) | (b[o + 3] & 0x7f);
 const writeSS = n => [(n >> 21) & 0x7f, (n >> 14) & 0x7f, (n >> 7) & 0x7f, n & 0x7f];
 const writeU32 = n => [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255];
 const ascii = (b, s, e) => String.fromCharCode(...b.subarray(s, e));
 
+function cat(...arrs) {
+  const total = arrs.reduce((n, a) => n + a.length, 0);
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const a of arrs) { out.set(a, o); o += a.length; }
+  return out;
+}
 function deunsync(b) {
   const out = [];
   for (let i = 0; i < b.length; i++) {
@@ -148,17 +156,110 @@ function deunsync(b) {
   return Uint8Array.from(out);
 }
 
-// Reads the existing ID3v2 tag. Keeps all frames except APIC (raw), so other metadata survives.
+// ----- text helpers -----
+function decodeBytes(enc, b) {
+  if (enc === 0) return new TextDecoder('windows-1252').decode(b);
+  if (enc === 3) return new TextDecoder('utf-8').decode(b);
+  let be = enc === 2;
+  if (b.length >= 2) {
+    if (b[0] === 0xff && b[1] === 0xfe) { be = false; b = b.subarray(2); }
+    else if (b[0] === 0xfe && b[1] === 0xff) { be = true; b = b.subarray(2); }
+  }
+  return new TextDecoder(be ? 'utf-16be' : 'utf-16le').decode(b);
+}
+function readTerm(enc, b, pos) {
+  if (enc === 1 || enc === 2) {
+    let i = pos;
+    while (i + 1 < b.length && !(b[i] === 0 && b[i + 1] === 0)) i += 2;
+    const end = Math.min(i, b.length);
+    return [b.subarray(pos, end), Math.min(i + 2, b.length)];
+  }
+  let i = pos;
+  while (i < b.length && b[i] !== 0) i++;
+  return [b.subarray(pos, i), Math.min(i + 1, b.length)];
+}
+function splitStrings(enc, b) {
+  const out = [];
+  let p = 0;
+  while (p < b.length) {
+    const [s, n] = readTerm(enc, b, p);
+    out.push(decodeBytes(enc, s));
+    p = n;
+  }
+  return out;
+}
+const pickEnc = strs => (strs.some(s => /[^\u0000-\u00ff]/.test(s)) ? 1 : 0);
+function encStr(e, s) {
+  if (e === 0) return Uint8Array.from(s, c => c.charCodeAt(0) & 255);
+  const u = new Uint8Array(2 + s.length * 2);
+  u[0] = 0xff; u[1] = 0xfe;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    u[2 + 2 * i] = c & 255; u[3 + 2 * i] = c >> 8;
+  }
+  return u;
+}
+const term = e => (e === 1 ? [0, 0] : [0]);
+const idBytes = id => Uint8Array.from(id, c => c.charCodeAt(0));
+const makeFrame3 = (id, body) => cat(idBytes(id), Uint8Array.from(writeU32(body.length)), Uint8Array.of(0, 0), body);
+function textFrame3(id, str) { const e = pickEnc([str]); return makeFrame3(id, cat([e], encStr(e, str))); }
+
+const V23_TEXT = new Set(('TALB TBPM TCOM TCON TCOP TDLY TENC TEXT TFLT TIT1 TIT2 TIT3 TKEY TLAN TLEN TMED ' +
+  'TOAL TOFN TOLY TOPE TOWN TPE1 TPE2 TPE3 TPE4 TPOS TPUB TRCK TRDA TRSN TRSO TSIZ TSRC TSSE').split(' '));
+const V23_URL = new Set('WCOM WCOP WOAF WOAR WOAS WORS WPAY WPUB'.split(' '));
+const V23_RAW = new Set('UFID PRIV POPM PCNT MCDI ETCO SYTC'.split(' '));
+
+// Convert one ID3v2.4 frame body into zero or more ID3v2.3 frames
+function convertFrame24(id, d) {
+  const out = [];
+  if (id === 'TXXX') {
+    const enc = d[0];
+    const [descB, next] = readTerm(enc, d, 1);
+    const desc = decodeBytes(enc, descB);
+    const val = splitStrings(enc, d.subarray(next)).join('/');
+    const e = pickEnc([desc, val]);
+    out.push(makeFrame3(id, cat([e], encStr(e, desc), term(e), encStr(e, val))));
+  } else if (id === 'WXXX') {
+    const enc = d[0];
+    const [descB, next] = readTerm(enc, d, 1);
+    const e = pickEnc([decodeBytes(enc, descB)]);
+    out.push(makeFrame3(id, cat([e], encStr(e, decodeBytes(enc, descB)), term(e), d.subarray(next))));
+  } else if (id === 'COMM' || id === 'USLT') {
+    const enc = d[0], lang = d.subarray(1, 4);
+    const [descB, next] = readTerm(enc, d, 4);
+    const desc = decodeBytes(enc, descB);
+    const text = decodeBytes(enc, d.subarray(next)).replace(/\u0000+$/, '');
+    const e = pickEnc([desc, text]);
+    out.push(makeFrame3(id, cat([e], lang, encStr(e, desc), term(e), encStr(e, text))));
+  } else if (id === 'TDRC' || id === 'TDOR') {
+    const ts = (splitStrings(d[0], d.subarray(1))[0] || '').trim();
+    const m = ts.match(/^(\d{4})(?:-(\d{2})-(\d{2}))?(?:T(\d{2}):(\d{2}))?/);
+    if (m) {
+      if (id === 'TDOR') out.push(textFrame3('TORY', m[1]));
+      else {
+        out.push(textFrame3('TYER', m[1]));
+        if (m[2]) out.push(textFrame3('TDAT', m[3] + m[2]));
+        if (m[4]) out.push(textFrame3('TIME', m[4] + m[5]));
+      }
+    }
+  } else if (V23_TEXT.has(id)) {
+    const strs = splitStrings(d[0], d.subarray(1));
+    while (strs.length && strs[strs.length - 1] === '') strs.pop();
+    out.push(textFrame3(id, strs.join('/')));
+  } else if (V23_URL.has(id) || V23_RAW.has(id)) {
+    out.push(makeFrame3(id, d));
+  }
+  // anything else exists only in v2.4 and is dropped
+  return out;
+}
+
+// Reads the existing ID3v2 tag; returns frames already in v2.3 form (APIC excluded)
 async function parseID3(file) {
   const h = new Uint8Array(await file.slice(0, 10).arrayBuffer());
-  const none = { version: 3, frames: [], audioStart: 0 };
-  if (h.length < 10 || h[0] !== 0x49 || h[1] !== 0x44 || h[2] !== 0x33) return none;
+  if (h.length < 10 || h[0] !== 0x49 || h[1] !== 0x44 || h[2] !== 0x33) return { frames: [], audioStart: 0 };
   const ver = h[3], flags = h[5], size = readSS(h, 6);
   const audioStart = 10 + size + ((ver === 4 && (flags & 0x10)) ? 10 : 0);
-  // v2.2 or unusual tags: old frames are dropped, a fresh v2.3 tag is written
-  if (ver < 3 || ver > 4 || (ver === 4 && (flags & 0x80))) {
-    return { version: 3, frames: [], audioStart, dropped: true };
-  }
+  if (ver < 3 || ver > 4 || (ver === 4 && (flags & 0x80))) return { frames: [], audioStart, dropped: true };
   let body = new Uint8Array(await file.slice(10, 10 + size).arrayBuffer());
   if (ver === 3 && (flags & 0x80)) body = deunsync(body);
   let pos = 0;
@@ -169,34 +270,29 @@ async function parseID3(file) {
     if (!/^[A-Z0-9]{4}$/.test(id)) break;
     const fsize = ver === 4 ? readSS(body, pos + 4) : u32(body, pos + 4);
     if (pos + 10 + fsize > body.length) break;
-    if (id !== 'APIC') frames.push(body.slice(pos, pos + 10 + fsize));
+    if (id !== 'APIC') {
+      if (ver === 3) frames.push(body.slice(pos, pos + 10 + fsize));
+      else if (!(body[pos + 9] & 0x4f)) frames.push(...convertFrame24(id, body.subarray(pos + 10, pos + 10 + fsize)));
+    }
     pos += 10 + fsize;
   }
-  return { version: ver, frames, audioStart };
+  return { frames, audioStart };
 }
 
-function buildAPIC(version, mime, data) {
-  const enc = new TextEncoder();
-  const mimeB = enc.encode(mime);
-  const size = 1 + mimeB.length + 1 + 1 + 1 + data.length;
-  const head = [0x41, 0x50, 0x49, 0x43, ...(version === 4 ? writeSS(size) : writeU32(size)), 0, 0];
-  const pre = [0, ...mimeB, 0, 3, 0]; // latin-1, mime, NUL, type=front cover, empty description, NUL
-  const out = new Uint8Array(head.length + pre.length + data.length);
-  out.set(head, 0);
-  out.set(pre, head.length);
-  out.set(data, head.length + pre.length);
-  return out;
+function buildAPIC(mime, data) {
+  const mimeB = new TextEncoder().encode(mime);
+  return makeFrame3('APIC', cat([0], mimeB, [0, 3, 0], data)); // latin-1, mime, front cover, empty description
 }
 
 // cover = {data: Uint8Array, mime} or null (remove covers)
 async function writeCover(file, cover) {
   const t = await parseID3(file);
   const frames = [...t.frames];
-  if (cover) frames.unshift(buildAPIC(t.version, cover.mime, cover.data));
+  if (cover) frames.unshift(buildAPIC(cover.mime, cover.data));
   const audio = file.slice(t.audioStart);
   if (!frames.length) return new Blob([audio], { type: 'audio/mpeg' });
   const total = frames.reduce((n, f) => n + f.length, 0);
-  const header = Uint8Array.from([0x49, 0x44, 0x33, t.version, 0, 0, ...writeSS(total)]);
+  const header = Uint8Array.from([0x49, 0x44, 0x33, 3, 0, 0, ...writeSS(total)]);
   return new Blob([header, ...frames, audio], { type: 'audio/mpeg' });
 }
 // </ID3>
